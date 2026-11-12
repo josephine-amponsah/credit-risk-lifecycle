@@ -1,15 +1,9 @@
-# frontend/requirements.txt — example, adjust to your actual imports
-dash
-gunicorn
-pandas
-numpy
-scikit-learn
-xgboost
-catboost
-httpx
-dash_bootstrap_components
-plotly
-Flask-Caching>=2.1.0,<3.0
-# requests
-numerize
-# pandas
+dash==2.18.2
+dash-bootstrap-components==1.6.0
+plotly==5.24.1
+pandas==2.2.3
+numpy==2.1.3
+httpx==0.28.1
+Flask-Caching==2.3.0
+numerize==0.12
+gunicorn==23.0.0

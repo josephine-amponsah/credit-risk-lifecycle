@@ -30,24 +30,27 @@ logger = logging.getLogger(__name__)
 
 DAYS_PER_MONTH = 30.4375  # average calendar month length, accounts for leap years
 
+# Default definition: charged off, in default, or 31-120 days late.
+# "In Grace Period" and "Late (16-30 days)" are early arrears, not default.
+# Note: "Does not meet the credit policy. Status:Fully Paid" must NOT match,
+# so we match on the status text after "Status:" when present.
 DEFAULT_STATUS_KEYWORDS = (
     "charged off",
     "default",
-    "late (",
-    "late",
-    "grace",
-    "does not meet",
+    "late (31-120",
 )
 
 DEFAULT_COX_COVARIATES = (
-    "credit_score",
-    "ltv",
+    "fico_range_low",
     "dti",
-    "loan_amount",
     "funded_amnt",
     "annual_inc",
     "int_rate",
 )
+
+# Basel-style asset correlation for retail unsecured exposures sits roughly
+# between 0.03 and 0.16; 0.05 is a reasonable default for consumer loans.
+DEFAULT_ASSET_CORRELATION = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +94,9 @@ def is_default_status(status: Any) -> bool:
     value = str(status).strip().lower()
     if not value:
         return False
+    # "Does not meet the credit policy. Status:Charged Off" -> "charged off"
+    if "status:" in value:
+        value = value.split("status:", 1)[1].strip()
     return any(keyword in value for keyword in DEFAULT_STATUS_KEYWORDS)
 
 
@@ -108,32 +114,47 @@ def _event_flags(df: pd.DataFrame) -> pd.Series:
 
 def _to_naive_datetime(series: pd.Series) -> pd.Series:
     """Parse to UTC then drop tz info, so mixed tz-aware/naive inputs compare cleanly."""
-    return pd.to_datetime(series, errors="coerce", utc=True).dt.tz_localize(None)
+    # Lending Club stores dates as "Mar-2019"; parse that format first, then fall back.
+    parsed = pd.to_datetime(series, format="%b-%Y", errors="coerce", utc=True)
+    if parsed.isna().all() and series.notna().any():
+        parsed = pd.to_datetime(series, errors="coerce", utc=True, format="mixed")
+    return parsed.dt.tz_localize(None)
+
+
+def snapshot_date(df: pd.DataFrame) -> pd.Timestamp:
+    """The data's as-of date: the latest payment date observed in the extract.
+
+    Censoring at today's date would give a 2013 loan 13 years of exposure even
+    though the data stops in 2019, so we censor at the extract date instead.
+    """
+    if "last_pymnt_d" in df.columns:
+        latest = _to_naive_datetime(df["last_pymnt_d"]).max()
+        if pd.notna(latest):
+            return latest.normalize()
+    return pd.Timestamp.utcnow().tz_localize(None).normalize()
 
 
 def months_since_issue(X: pd.DataFrame) -> pd.Series:
     """Observation window, in months, for each loan.
 
-    Defaulted loans are measured issue_d -> last_pymnt_d (the last date we know
-    the loan was alive). All other loans are right-censored at "now". Returns 0
-    for rows that can't be parsed rather than dropping them, so the output
-    always aligns 1:1 with the input index.
+    - Defaulted loans: issue_d -> last_pymnt_d (last date known alive).
+    - Paid-off loans: issue_d -> last_pymnt_d (they leave the risk set at payoff).
+    - Still-active loans: issue_d -> snapshot date of the extract.
+    Returns 0 for rows that can't be parsed so the output aligns 1:1 with input.
     """
     df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
     if df.empty or "issue_d" not in df.columns:
         return pd.Series(dtype=float, index=df.index)
 
     issue_d = _to_naive_datetime(df["issue_d"])
-    now = pd.Timestamp.utcnow().tz_localize(None).normalize()
+    reference_dates = pd.Series(snapshot_date(df), index=df.index)
 
-    reference_dates = pd.Series(now, index=df.index)
     if "last_pymnt_d" in df.columns:
         last_pymnt_d = _to_naive_datetime(df["last_pymnt_d"])
-        default_mask = _event_flags(df).astype(bool)
-        # only use last_pymnt_d where it's actually populated; otherwise fall
-        # back to "now" rather than introducing NaT censoring dates
-        usable_last_pymnt = default_mask & last_pymnt_d.notna()
-        reference_dates = reference_dates.mask(usable_last_pymnt, last_pymnt_d)
+        status = df["loan_status"].astype(str).str.lower() if "loan_status" in df.columns else pd.Series("", index=df.index)
+        closed = _event_flags(df).astype(bool) | status.str.contains("fully paid")
+        use_last_payment = closed & last_pymnt_d.notna()
+        reference_dates = reference_dates.mask(use_last_payment, last_pymnt_d)
 
     months = ((reference_dates - issue_d).dt.days / DAYS_PER_MONTH).clip(lower=0)
     return months.fillna(0.0)
@@ -345,56 +366,173 @@ def survival(X: pd.DataFrame) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# expected loss / simulation (unchanged from original)
+# Expected loss: EL = PD x LGD x EAD
 # ---------------------------------------------------------------------------
+#
+# PD  : calibrated lifetime probability of default (`pd_calibrated`, written by
+#       scripts/prepare_data.py). Raw model scores are NOT probabilities.
+# LGD : share of the exposure lost after recoveries, estimated per grade from
+#       loans that actually defaulted.
+# EAD : share of the funded amount still outstanding at default, estimated per
+#       grade from defaulted loans (a simple credit-conversion factor).
+
+def _num(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+
+def pd_column(df: pd.DataFrame) -> pd.Series:
+    """Calibrated PD if available; otherwise the raw score, with a warning."""
+    if "pd_calibrated" in df.columns:
+        return _num(df, "pd_calibrated").clip(0.0, 1.0)
+    logger.warning("pd_calibrated missing: using raw prob_default, which is not a calibrated probability")
+    return _num(df, "prob_default").clip(0.0, 1.0)
+
+
+def realised_loss(df: pd.DataFrame) -> pd.Series:
+    """Principal lost on defaulted loans, net of recoveries (0 for non-defaults)."""
+    lost = (_num(df, "funded_amnt") - _num(df, "total_rec_prncp")
+            - _num(df, "recoveries") + _num(df, "collection_recovery_fee")).clip(lower=0.0)
+    return lost.where(_event_flags(df).astype(bool), 0.0)
+
+
+def lgd_ead_by_grade(df: pd.DataFrame, group_col: str = "grade") -> pd.DataFrame:
+    """Empirical LGD and EAD factor per grade, from loans that defaulted."""
+    defaulted = df[_event_flags(df).astype(bool)].copy()
+    if defaulted.empty:
+        return pd.DataFrame(columns=[group_col, "lgd", "ead_factor", "n_defaults"])
+    funded = _num(defaulted, "funded_amnt").replace(0, np.nan)
+    exposure = (funded - _num(defaulted, "total_rec_prncp")).clip(lower=0.0)
+    net_recovery = _num(defaulted, "recoveries") - _num(defaulted, "collection_recovery_fee")
+    defaulted["ead_factor"] = (exposure / funded).clip(0.0, 1.0)
+    defaulted["lgd"] = (1.0 - net_recovery / exposure.replace(0, np.nan)).clip(0.0, 1.0)
+    key = group_col if group_col in defaulted.columns else None
+    grouped = defaulted.groupby(key, observed=True) if key else defaulted.assign(_all="all").groupby("_all")
+    out = grouped.agg(lgd=("lgd", "mean"), ead_factor=("ead_factor", "mean"),
+                      n_defaults=("lgd", "size")).reset_index()
+    return out.rename(columns={"_all": group_col})
+
+
+def _attach_lgd_ead(df: pd.DataFrame, group_col: str = "grade") -> pd.DataFrame:
+    params = lgd_ead_by_grade(df, group_col)
+    out = df.copy()
+    if group_col in out.columns and not params.empty:
+        out = out.merge(params[[group_col, "lgd", "ead_factor"]], on=group_col, how="left")
+    overall = lgd_ead_by_grade(df.drop(columns=[group_col], errors="ignore"), group_col)
+    fallback_lgd = float(overall["lgd"].iloc[0]) if not overall.empty else 0.6
+    fallback_ead = float(overall["ead_factor"].iloc[0]) if not overall.empty else 0.6
+    out["lgd"] = out.get("lgd", pd.Series(np.nan, index=out.index)).fillna(fallback_lgd)
+    out["ead_factor"] = out.get("ead_factor", pd.Series(np.nan, index=out.index)).fillna(fallback_ead)
+    out.index = df.index
+    return out
+
 
 def expected_loss(X: pd.DataFrame):
-    """Compute expected loss given a DataFrame with a `prob_default` column.
+    """Lifetime expected loss at origination: PD x LGD x (EAD factor x funded amount).
 
-    EL is computed as min-max-scaled probability_of_default * exposure
-    (funded_amnt). Returns total expected loss and the per-loan EL series.
+    Returns (total EL, per-loan EL series, per-grade table).
+    """
+    df = _attach_lgd_ead(X)
+    ead = df["ead_factor"] * _num(df, "funded_amnt")
+    el = pd_column(df) * df["lgd"] * ead
+    by_grade = pd.DataFrame()
+    if "grade" in df.columns:
+        by_grade = (df.assign(el=el, ead=ead, pd=pd_column(df))
+                      .groupby("grade", observed=True)
+                      .agg(n_loans=("el", "size"), expected_loss=("el", "sum"),
+                           avg_pd=("pd", "mean"), lgd=("lgd", "first"))
+                      .reset_index())
+    return float(el.sum()), el, by_grade
+
+
+def backtest_by_vintage(X: pd.DataFrame) -> pd.DataFrame:
+    """Expected vs realised loss and default rate per issue quarter.
+
+    Only fully matured vintages give a fair comparison, so the share of loans
+    still active is returned alongside each row.
     """
     df = X.copy()
-    raw_probs = df["prob_default"].astype(float).fillna(0.0) if "prob_default" in df.columns else pd.Series(0.0, index=df.index)
-    lo, hi = raw_probs.min(), raw_probs.max()
-    if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
-        scaled = (raw_probs - lo) / (hi - lo)
-    else:
-        scaled = raw_probs.clip(0.0, 1.0)
-    df["scaled_probs"] = scaled
+    if df.empty or "issue_d" not in df.columns:
+        return pd.DataFrame()
+    _, el, _ = expected_loss(df)
+    status = df["loan_status"].astype(str).str.lower() if "loan_status" in df.columns else pd.Series("", index=df.index)
+    df = df.assign(
+        vintage=pd.to_datetime(df["issue_d"], errors="coerce").dt.to_period("Q").astype(str),
+        el=el, realised=realised_loss(df), pd=pd_column(df),
+        defaulted=_event_flags(df), active=status.str.contains("current|grace|late \\(16"),
+    )
+    out = (df.groupby("vintage", observed=True)
+             .agg(n_loans=("el", "size"), expected_loss=("el", "sum"), realised_loss=("realised", "sum"),
+                  predicted_default_rate=("pd", "mean"), observed_default_rate=("defaulted", "mean"),
+                  share_active=("active", "mean"))
+             .reset_index())
+    out["loss_ratio"] = out["realised_loss"] / out["expected_loss"].replace(0, np.nan)
+    return out
 
-    exposure = df.get("funded_amnt", pd.Series([0] * len(df))).astype(float).fillna(0.0)
-    el = df["scaled_probs"] * exposure
-    return float(el.sum()), el
+
+# ---------------------------------------------------------------------------
+# Credit VaR: one-factor Vasicek / Gaussian copula
+# ---------------------------------------------------------------------------
+#
+# Defaults are NOT independent: a weak economy pushes many borrowers into
+# default at once. In the one-factor model each borrower's credit quality is
+#   A_i = sqrt(rho) * Z + sqrt(1 - rho) * e_i
+# where Z is the shared economic factor. Conditional on Z, the default
+# probability is
+#   p_i(Z) = Phi( (Phi^-1(PD_i) - sqrt(rho) * Z) / sqrt(1 - rho) )
+# For a large, granular loan book, the loss given Z is close to its
+# conditional expectation sum_i p_i(Z) * LGD_i * EAD_i (the ASRF assumption
+# behind Basel IRB), so we simulate Z only.
+
+def _norm():
+    from scipy.stats import norm  # scipy ships with scikit-learn
+    return norm
 
 
-def npv(X):
-    return None
+def _pd_exposure_buckets(df: pd.DataFrame, n_buckets: int = 200):
+    """Group loans into PD buckets so simulation cost doesn't grow with book size.
+
+    Loss is linear in exposure, so summing LGD x EAD within narrow PD buckets
+    gives practically the same distribution as loan-by-loan simulation.
+    """
+    frame = _attach_lgd_ead(df)
+    pd_i = pd_column(frame).clip(1e-6, 1 - 1e-6)
+    exposure = frame["lgd"] * frame["ead_factor"] * _num(frame, "funded_amnt")
+    buckets = pd.qcut(pd_i.rank(method="first"), q=min(n_buckets, len(pd_i)), labels=False)
+    grouped = pd.DataFrame({"pd": pd_i, "w": exposure, "b": buckets}).groupby("b")
+    weight = grouped["w"].sum()
+    weighted_pd = (pd.DataFrame({"pd": pd_i * exposure, "b": buckets}).groupby("b")["pd"].sum())
+    mean_pd = (weighted_pd / weight.replace(0, np.nan)).fillna(grouped["pd"].mean())
+    return mean_pd.values, weight.values
 
 
-def simulate_portfolio_losses(df: pd.DataFrame, nsim: int = 2000, seed: Optional[int] = None, batch_size: int = 500) -> np.ndarray:
-    """Monte Carlo simulation of portfolio-level losses via independent Bernoulli defaults."""
-    rnd = np.random.RandomState(seed)
-    raw = df["prob_default"].astype(float).fillna(0.0) if "prob_default" in df.columns else pd.Series(0.0, index=df.index)
-    lo, hi = raw.min(), raw.max()
-    if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
-        probs = np.clip(((raw - lo) / (hi - lo)).values, 0.0, 1.0)
-    else:
-        probs = np.clip(raw.values, 0.0, 1.0)
-
-    exposure = df.get("funded_amnt", pd.Series([0] * len(df))).astype(float).fillna(0.0).values
-    n = len(probs)
-    if n == 0:
+def simulate_portfolio_losses(df: pd.DataFrame, nsim: int = 5000, rho: float = DEFAULT_ASSET_CORRELATION,
+                              seed: Optional[int] = 42, batch_size: int = 250) -> np.ndarray:
+    """Simulated portfolio loss distribution under the one-factor model."""
+    if df is None or df.empty:
         return np.array([])
-
-    port_losses = np.empty(nsim)
+    norm = _norm()
+    pd_i, exposure = _pd_exposure_buckets(df)
+    threshold = norm.ppf(pd_i)
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal(nsim)
+    losses = np.empty(nsim)
     for start in range(0, nsim, batch_size):
-        end = min(start + batch_size, nsim)
-        draws = rnd.rand(end - start, n)  # small chunk, not the whole nsim
-        defaults = draws < probs
-        port_losses[start:end] = (defaults * exposure).sum(axis=1)
-        del draws, defaults  # free immediately
-    return port_losses
+        zb = z[start:start + batch_size, None]
+        cond_pd = norm.cdf((threshold[None, :] - np.sqrt(rho) * zb) / np.sqrt(1 - rho))
+        losses[start:start + batch_size] = cond_pd @ exposure
+    return losses
+
+
+def vasicek_var(df: pd.DataFrame, confidence: float = 0.99, rho: float = DEFAULT_ASSET_CORRELATION) -> float:
+    """Closed-form loss quantile of the one-factor model (no simulation needed)."""
+    if df is None or df.empty:
+        return 0.0
+    norm = _norm()
+    pd_i, exposure = _pd_exposure_buckets(df)
+    stressed = norm.cdf((norm.ppf(pd_i) + np.sqrt(rho) * norm.ppf(confidence)) / np.sqrt(1 - rho))
+    return float(stressed @ exposure)
 
 
 def var_from_simulations(losses: np.ndarray, confidence: float = 0.95) -> float:

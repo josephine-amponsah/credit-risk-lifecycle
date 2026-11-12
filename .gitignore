@@ -24,3 +24,4 @@ credit-portfolio-risk-monitoring/build/
 credit-risk-scorecard/data/credit_scoring_data/
 *.pkl
 !credit-risk-scorecard/artefacts/*.pkl
+credit-portfolio-risk-monitoring/.DS_Store
