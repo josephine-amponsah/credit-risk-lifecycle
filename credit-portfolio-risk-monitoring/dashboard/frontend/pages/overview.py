@@ -3,7 +3,7 @@ from dash import html, dcc, Input, Output, callback
 import pandas as pd
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
-import numerize
+from numerize import numerize
 
 from services.api_client import get_summary, get_aggregates, get_options, get_periods
 
