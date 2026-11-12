@@ -57,6 +57,10 @@ DEFAULT_ASSET_CORRELATION = 0.05
 # small numeric helpers
 # ---------------------------------------------------------------------------
 
+COX_FIT_SAMPLE = 20_000
+COX_CURVE_SAMPLE = 1_000
+
+
 def _finite_or_none(value: Any) -> Optional[float]:
     """Cast to float, returning None for NaN/inf/unparseable values."""
     try:
@@ -289,7 +293,9 @@ def _cox_average_survival_curve(cph, cov_df: pd.DataFrame) -> Optional[Dict[str,
     if cov_df.empty:
         return None
     try:
-        predicted = cph.predict_survival_function(cov_df)
+        # Averaging per-loan curves builds a (time points x loans) matrix; 1,000 loans is plenty for a mean.
+        sample = cov_df.sample(min(len(cov_df), COX_CURVE_SAMPLE), random_state=0)
+        predicted = cph.predict_survival_function(sample)
         mean_survival = predicted.mean(axis=1)
     except Exception:
         logger.warning("Cox survival-curve prediction failed", exc_info=True)
@@ -333,6 +339,9 @@ def cox_hazard(X: pd.DataFrame, covariates: Optional[Sequence[str]] = None) -> D
             "fallback": "lifelines not installed; Cox model unavailable",
         }
 
+    # Hazard ratios are stable on a 20k-loan sample; fitting on 130k+ loans per request is not needed.
+    if len(cph_df) > COX_FIT_SAMPLE:
+        cph_df = cph_df.sample(COX_FIT_SAMPLE, random_state=0)
     cph = CoxPHFitter()
     cph.fit(cph_df, duration_col="duration", event_col="event")
 

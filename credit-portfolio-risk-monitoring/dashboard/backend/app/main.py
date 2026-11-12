@@ -1,4 +1,5 @@
 """Portfolio risk API: overview metrics, expected loss, credit VaR, survival and backtesting."""
+import functools
 import logging
 import os
 from typing import Optional
@@ -31,15 +32,12 @@ def overview_summary(period: Optional[str] = None, loan_purpose: Optional[str] =
     - period: e.g. '2018Q4'
     - loan_purpose: comma-separated list of loan purpose values
     """
-    df = insights.load_data(period).copy()
+    df = insights.load_data(period)
     # df = insights.load_data(period)
     if df is None or df.empty:
         return {'total_lent': 0.0, 'repaid': 0.0, 'default_rate': 0.0, 'interest_earned': 0.0}
     if loan_purpose:
         vals = [v.strip() for v in loan_purpose.split(',') if v.strip()]
-        # ensure loan_purpose column exists
-        if 'loan_purpose' not in df.columns and 'purpose' in df.columns:
-            df['loan_purpose'] = df['purpose']
         if 'loan_purpose' in df.columns:
             df = df[df['loan_purpose'].isin(vals)]
     return insights.summary(df)
@@ -50,13 +48,11 @@ def overview_aggregates(period: Optional[str] = None, loan_purpose: Optional[str
     """Return grouped aggregates by loan purpose.
     Returns JSON: { data: [ {loan_purpose, lent, repaid, interest}, ... ] }
     """
-    df = insights.load_data(period).copy()
+    df = insights.load_data(period)
     if df is None or df.empty:
         return {'data': []}
     if loan_purpose:
         vals = [v.strip() for v in loan_purpose.split(',') if v.strip()]
-        if 'loan_purpose' not in df.columns and 'purpose' in df.columns:
-            df['loan_purpose'] = df['purpose']
         if 'loan_purpose' in df.columns:
             df = df[df['loan_purpose'].isin(vals)]
     rows = insights.aggregates(df)
@@ -66,7 +62,7 @@ def overview_aggregates(period: Optional[str] = None, loan_purpose: Optional[str
 @app.get("/overview/options")
 def overview_options(period: Optional[str] = None):
     """Return available loan purpose options for the period (or latest when omitted)."""
-    df = insights.load_data(period).copy()
+    df = insights.load_data(period)
     if df is None or df.empty:
         return {'loan_purposes': []}
     opts = insights.loan_purposes(df)
@@ -77,7 +73,7 @@ def overview_options(period: Optional[str] = None):
 def overview_periods():
     """Return available period identifiers (e.g. '2018Q4')."""
     try:
-        periods = insights.list_periods().copy()
+        periods = insights.list_periods()
         return {'periods': periods}
     except Exception:
         return {'periods': []}
@@ -88,7 +84,7 @@ def overview_periods():
 def risk_expected_loss(period: Optional[str] = None):
     """Return total expected loss and simple breakdown for the requested period."""
     try:
-        df = insights.load_data(period).copy()
+        df = insights.load_data(period)
         if df is None or df.empty:
             return {'total_expected_loss': 0.0, 'n_loans': 0}
         total_el, _, by_grade = risk_metrics.expected_loss(df)
@@ -114,7 +110,7 @@ def risk_var(period: Optional[str] = None, confidence: float = 0.99, nsim: int =
     - rho: asset correlation (0.03-0.16 is typical for retail unsecured loans)
     """
     try:
-        df = insights.load_data(period).copy()
+        df = insights.load_data(period)
         if df is None or df.empty:
             return {'var': 0.0, 'expected_loss': 0.0, 'hist': {'bins': [], 'counts': []}}
         losses = risk_metrics.simulate_portfolio_losses(df, nsim=int(nsim), rho=float(rho))
@@ -152,20 +148,23 @@ def risk_backtest():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@functools.lru_cache(maxsize=16)
+def _survival_cached(period: str, loan_purpose: str):
+    df = insights.load_data(period)
+    vals = [v.strip() for v in loan_purpose.split(',') if v.strip()]
+    if vals:
+        df = df[df['loan_purpose'].isin(vals)]
+    return risk_metrics.survival(df)
+
+
 @app.get("/survival")
 def survival(period: Optional[str] = None, loan_purpose: Optional[str] = None):
-    """Return a simple Kaplan-Meier style survival curve for the cohort."""
+    """Kaplan-Meier curve plus Cox hazard ratios, cached per (quarter, purpose filter)."""
     try:
-        df = insights.load_data(period).copy()
-        if df is None or df.empty:
+        resolved = insights.resolve_period(period)
+        if resolved is None:
             return {'months': [], 'survival': [], 'events': [], 'at_risk': [], 'median_months': None, 'n_loans': 0}
-        if loan_purpose:
-            vals = [v.strip() for v in loan_purpose.split(',') if v.strip()]
-            if 'loan_purpose' not in df.columns and 'purpose' in df.columns:
-                df['loan_purpose'] = df['purpose']
-            if 'loan_purpose' in df.columns:
-                df = df[df['loan_purpose'].isin(vals)]
-        result = risk_metrics.survival(df)
-        return result
+        return _survival_cached(resolved, loan_purpose or '')
     except Exception as e:
-        return {'months': [], 'survival': [], 'events': [], 'at_risk': [], 'median_months': None, 'n_loans': 0, 'error': str(e)}
+        logger.exception("survival failed")
+        raise HTTPException(status_code=500, detail=str(e))
