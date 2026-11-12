@@ -1,15 +1,26 @@
 **/.DS_Store
 credit-portfolio-risk-monitoring/.DS_Store
 /.venv
-credit-portfolio-risk-monitoring/data/accepted_2007_to_2018Q4.csv
 __pycache__/
 credit-portfolio-risk-monitoring/**/__pycache__/
 **/__pycache__/
 *.pyc
-
 credit-portfolio-risk-monitoring/dashboard/backend/app/services/__pycache__/insights.cpython-311.pyc
 credit-portfolio-risk-monitoring/dashboard/backend/app/services/__pycache__/risk_metrics.cpython-311.pyc
 credit-portfolio-risk-monitoring/dashboard/frontend/pages/__pycache__/npv_backtesting.cpython-311.pyc
 credit-portfolio-risk-monitoring/notebooks/.DS_Store
 credit-portfolio-risk-monitoring/.DS_Store
 credit-portfolio-risk-monitoring/notebooks/.DS_Store
+.pytest_cache/
+.ipynb_checkpoints/
+# Secrets
+.env
+*.env
+!.env.example
+# Large / generated data
+credit-portfolio-risk-monitoring/data/accepted_2007_to_2018Q4.csv
+credit-portfolio-risk-monitoring/notebooks/data_splits/
+credit-portfolio-risk-monitoring/build/
+credit-risk-scorecard/data/credit_scoring_data/
+*.pkl
+!credit-risk-scorecard/artefacts/*.pkl
