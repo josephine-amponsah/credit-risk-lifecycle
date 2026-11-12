@@ -1,0 +1,11 @@
+{
+  "train_vintages": "<= 2014Q4",
+  "test_vintages": "> 2014Q4 and <= 2015Q4",
+  "n_train": 358244,
+  "n_test": 376905,
+  "test_auc": 0.7409,
+  "test_gini": 0.4818,
+  "test_brier": 0.1433,
+  "test_default_rate": 0.2047,
+  "test_mean_pd": 0.1772
+}

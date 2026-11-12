@@ -79,8 +79,8 @@ def get_expected_loss(period=None):
     return resp.json()
 
 
-def get_var(period=None, confidence=0.95, nsim=3000):
-    params = {"confidence": confidence, "nsim": nsim}
+def get_var(period=None, confidence=0.99, nsim=5000, rho=0.05):
+    params = {"confidence": confidence, "nsim": nsim, "rho": rho}
     if period:
         params["period"] = period
     resp = httpx.get(f"{API_BASE}/risk/var", params=params, timeout=60)
@@ -95,5 +95,10 @@ def get_survival(period=None, loan_purpose=None):
     if loan_purpose:
         params["loan_purpose"] = _to_csv(loan_purpose)
     resp = httpx.get(f"{API_BASE}/survival", params=params, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+def get_backtest():
+    resp = httpx.get(f"{API_BASE}/risk/backtest", timeout=20)
     resp.raise_for_status()
     return resp.json()

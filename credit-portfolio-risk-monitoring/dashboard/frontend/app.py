@@ -17,7 +17,6 @@ import functools
 from pathlib import Path
 
 from flask_caching import Cache
-sys.path.insert(0, '../modules')
 dbc_css = "https://cdn.jsdelivr.net/gh/AnnMarieW/dash-bootstrap-templates/dbc.css"
 
 pio.templates["flatly"] = go.layout.Template(
@@ -124,7 +123,7 @@ app.layout = html.Div([
                             ], id="overview-item", className="nav-item"),
                         html.Li(
                                 [
-                            html.A("Vintage Analysis", id="risk-segments-link", className="nav-link", href=dash.page_registry['pages.risk_segments']['path'])
+                            html.A("Credit Risk & VaR", id="risk-segments-link", className="nav-link", href=dash.page_registry['pages.risk_segments']['path'])
                                 ], id="risk-segments-item", className = "nav-item"),
                         html.Li(
                                 [
@@ -187,4 +186,4 @@ def update_nav_classes(pathname):
 
 if __name__ == '__main__':
     # model = joblib.load("modules/forecaster.pkl")
-    app.run(debug=True, host='127.0.0.1', port=8080)
+    app.run(debug=os.getenv('DASH_DEBUG') == '1', host='0.0.0.0', port=int(os.getenv('PORT', 8050)))
