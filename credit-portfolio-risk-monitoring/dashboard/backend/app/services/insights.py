@@ -16,6 +16,7 @@ import io
 import json
 import requests
 import pandas as pd
+import pyarrow.parquet as pq
 import functools
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -62,68 +63,42 @@ def _list_remote_datafiles(data_url: str, timeout: int = 10) -> List[str]:
 	return [it['name'] for it in items if it.get('name', '').startswith('data_')]
 
 
-@functools.lru_cache(maxsize=3)
-def load_data(period=None, data_url=DEFAULT_DATA_URL, timeout=10) -> pd.DataFrame:
-	"""Load data for a given quarter period (e.g. '2018Q4').
+# Only the columns the API uses. Reading all 150+ Lending Club columns costs ~350 MB per quarter.
+USECOLS = [
+	'id', 'issue_d', 'loan_status', 'last_pymnt_d', 'term', 'grade', 'sub_grade', 'purpose',
+	'int_rate', 'funded_amnt', 'out_prncp', 'total_rec_prncp', 'total_rec_int', 'recoveries',
+	'collection_recovery_fee', 'annual_inc', 'dti', 'fico_range_low', 'prob_default', 'pd_calibrated',
+]
+CATEGORICAL = ['loan_status', 'term', 'grade', 'sub_grade', 'purpose']
 
-	This deployment uses the backend data directory, so the function prefers the
-	local parquet files under dashboard/backend/app/data before any remote fetch.
-	"""
-	try:
-		local_dirs = [
-				Path(data_url) if data_url and Path(data_url).exists() else None,
-				DEFAULT_DATA_DIR,
-				FALLBACK_DATA_DIR,
-			]
-		for local_dir in local_dirs:
-			if local_dir is None or not local_dir.exists():
-				continue
-			names = [n for n in os.listdir(local_dir) if n.startswith('data_')]
-			if not names:
-				continue
-			if not period:
-				period = sorted([n.split('data_')[1].split('.')[0] for n in names])[-1]
-			for ext in ('.parquet', '.csv.gz', '.csv'):
-				p = local_dir / f"data_{period}{ext}"
-				if p.exists():
-					try:
-						if p.suffix == '.parquet':
-							df = pd.read_parquet(p)
-						else:
-							df = pd.read_csv(p, parse_dates=['issue_d'], low_memory=False)
-						return _normalize_object_columns(df)
-					except Exception:
-						continue
 
-		# Remote fallback only if the local backend folder is unavailable.
-		if not data_url or not data_url.startswith('https://'):
-			return pd.DataFrame()
-		owner_repo, rest = data_url.replace('https://github.com/', '').split('/tree/', 1)
-		branch, _, path = rest.partition('/')
-		api_url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
-		resp = requests.get(api_url, params={'ref': branch}, timeout=timeout)
-		if resp.status_code != 200:
-			return pd.DataFrame()
-		items = resp.json()
-		names = [it['name'] for it in items if it.get('name', '').startswith('data_')]
-		if not names:
-			return pd.DataFrame()
-		if not period:
-			period = sorted([n.split('data_')[1].split('.')[0] for n in names])[-1]
+def list_periods(data_dir: Path = DEFAULT_DATA_DIR) -> List[str]:
+	return sorted(n[len('data_'):].split('.')[0] for n in os.listdir(data_dir) if n.startswith('data_'))
 
-		raw_base = f"https://raw.githubusercontent.com/{owner_repo}/{branch}/{path}".rstrip('/')
-		for name in (f"data_{period}.parquet", f"data_{period}.csv.gz", f"data_{period}.csv"):
-			r = requests.get(f"{raw_base}/{name}", timeout=timeout)
-			if r.status_code != 200:
-				continue
-			try:
-				df = _read_bytes_to_df(r.content, name)
-				return _normalize_object_columns(df)
-			except Exception:
-				continue
-		return pd.DataFrame()
-	except Exception:
-		return pd.DataFrame()
+
+def resolve_period(period: Optional[str]) -> Optional[str]:
+	periods = list_periods()
+	if not periods:
+		return None
+	return period if period in periods else periods[-1]
+
+
+def load_data(period: Optional[str] = None) -> pd.DataFrame:
+	"""Return the (read-only, cached) loan frame for a quarter. Callers must not mutate it."""
+	resolved = resolve_period(period)
+	return _load_period(resolved) if resolved else pd.DataFrame()
+
+
+@functools.lru_cache(maxsize=1)   # keyed on the resolved period, so None and '2018Q4' share one entry
+def _load_period(period: str) -> pd.DataFrame:
+	path = DEFAULT_DATA_DIR / f'data_{period}.parquet'
+	available = set(pq.read_schema(path).names)
+	df = pd.read_parquet(path, columns=[c for c in USECOLS if c in available])
+	for c in CATEGORICAL:
+		if c in df.columns:
+			df[c] = df[c].astype('category')
+	df['loan_purpose'] = df['purpose'] if 'purpose' in df.columns else pd.Series(dtype='category')
+	return df
 
 
 def _ensure_loan_purpose_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -222,24 +197,4 @@ def loan_purposes(df: pd.DataFrame) -> List[str]:
 	opts = sorted(pd.Series(df['loan_purpose'].dropna().unique()).astype(str).tolist())
 	return opts
 
-
-def list_periods(data_url: str = DEFAULT_DATA_URL, timeout: int = 10) -> List[str]:
-	try:
-		local_dir = Path(data_url)
-		if local_dir.is_dir():
-			names = [n for n in os.listdir(local_dir) if n.startswith('data_')]
-			if names:
-				periods = sorted({n.split('data_')[1].split('.')[0] for n in names})
-				return periods
-	except Exception:
-		pass
-
-	try:
-		names = _list_remote_datafiles(data_url, timeout=timeout)
-		if not names:
-			return []
-		periods = sorted({n.split('data_')[1].split('.')[0] for n in names})
-		return periods
-	except Exception:
-		return []
 
